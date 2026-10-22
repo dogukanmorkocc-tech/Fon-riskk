@@ -1,0 +1,1335 @@
+"""TEFAS Fon Analiz Paneli v3 - tutarlı getiri/risk hesaplaması
+Çalıştır: streamlit run app.py   (requirements.txt aynı kalabilir)
+"""
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Fon Analiz Paneli", layout="wide")
+TD = 252
+
+
+# ---------- Veri ----------
+@st.cache_data(show_spinner="TEFAS verisi çekiliyor...", ttl=3600)
+def load_tefas(codes, start, end):
+    from tefas import Crawler  # pip install tefas-crawler
+    crawler = Crawler()
+    attempts = [
+        ["code", "date", "price", "market_cap", "number_of_investors", "title"],
+        ["code", "date", "price", "market_cap", "number_of_shares",
+         "number_of_investors", "title"],
+        ["code", "date", "price"],
+    ]
+    frames = []
+    for code in codes:
+        df = None
+        for cols in attempts:
+            try:
+                df = crawler.fetch(start=start, end=end, name=code, columns=cols)
+                break
+            except Exception:
+                continue
+        if df is None:
+            raise RuntimeError(f"{code} için TEFAS verisi alınamadı")
+        frames.append(df)
+    df = pd.concat(frames)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data
+def load_synthetic(codes, start, end, seed=42):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range(start, end)
+    frames = []
+    for c in codes:
+        mu, sg = rng.uniform(0.0003, 0.0012), rng.uniform(0.002, 0.012)
+        r = rng.normal(mu, sg, len(idx))
+        r[rng.integers(0, len(idx), 2)] -= 4 * sg  # anomali tohumu
+        price = 100 * np.exp(np.cumsum(r))
+        shares = 1e6 * np.exp(np.cumsum(rng.normal(0.001, 0.01, len(idx))))
+        inv = (5000 * np.exp(np.cumsum(rng.normal(0.0005, 0.004, len(idx))))).round()
+        frames.append(pd.DataFrame({
+            "code": c, "date": idx, "price": price,
+            "number_of_shares": shares, "market_cap": shares * price,
+            "number_of_investors": inv, "title": f"{c} Demo Fon"}))
+    return pd.concat(frames)
+
+
+def to_wide(df):
+    out = {}
+    df = df.copy()
+    for col in ["price", "market_cap", "number_of_shares", "number_of_investors"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            out[col] = df.pivot_table(index="date", columns="code", values=col,
+                                      aggfunc="last").sort_index()
+    # Fiyat serisi doldurulmaz: boşluklar sahte sıfır getiri üretmesin
+    out["price"] = out["price"].dropna(how="all")
+    if "number_of_shares" not in out and "market_cap" in out:
+        out["number_of_shares"] = (out["market_cap"].ffill() / out["price"]) \
+            .replace([np.inf, -np.inf], np.nan)
+    return out
+
+
+# ---------- Getiri ve risk çekirdeği ----------
+def returns_df(p):
+    """Her fon kendi gözlem tarihlerinde: r_t = P_t / P_(t-1) - 1."""
+    return pd.concat({c: p[c].dropna().pct_change() for c in p}, axis=1)
+
+
+def obs_per_year(s):
+    """Yıllık gözlem sayısı = gözlem / (takvim günü / 365,25)."""
+    s = s.dropna()
+    days = (s.index[-1] - s.index[0]).days
+    return (len(s) - 1) / (days / 365.25) if days > 0 and len(s) > 1 else float(TD)
+
+
+def period_returns(p):
+    last = p.index[-1]
+    cut = {
+        "1 Hafta": last - pd.Timedelta(days=7),
+        "1 Ay": last - pd.DateOffset(months=1),
+        "3 Ay": last - pd.DateOffset(months=3),
+        "6 Ay": last - pd.DateOffset(months=6),
+        "Yıl başı": pd.Timestamp(year=last.year - 1, month=12, day=31),
+        "1 Yıl": last - pd.DateOffset(years=1),
+    }
+    rows = {}
+    for c in p:
+        s = p[c].dropna()
+        row = {}
+        for k, t in cut.items():
+            v = s.asof(t)
+            row[k] = s.iloc[-1] / v - 1 if pd.notna(v) else np.nan
+        rows[c] = row
+    df = pd.DataFrame(rows).T
+    df.insert(0, "Sıra (3 Ay)", df["3 Ay"].rank(ascending=False).astype("Int64"))
+    return df.sort_values("Sıra (3 Ay)")
+
+
+def risk_table(p, bench, rf=0.40, alpha=0.95):
+    R = returns_df(p)
+    rows = {}
+    for c in p:
+        s = p[c].dropna()
+        if len(s) < 21:
+            continue
+        r = R[c].dropna()
+        days = (s.index[-1] - s.index[0]).days
+        ppy = obs_per_year(s)
+        total = s.iloc[-1] / s.iloc[0] - 1
+        ann = (1 + total) ** (365.25 / days) - 1
+        vol = r.std() * np.sqrt(ppy)
+        rf_d = (1 + rf) ** (1 / ppy) - 1          # risksiz oran, gözlem periyoduna
+        ex = r - rf_d
+        sharpe = ex.mean() / ex.std() * np.sqrt(ppy) if ex.std() else np.nan
+        dd = (s / s.cummax() - 1).min()
+        var = -np.percentile(r, (1 - alpha) * 100)
+        cvar = -r[r <= -var].mean()
+        row = {"Dönem getirisi": total, "Yıllık getiri": ann,
+               "Yıllık volatilite": vol, "Sharpe": sharpe, "Maks. düşüş": dd,
+               f"VaR %{int(alpha*100)} (1g)": var,
+               f"CVaR %{int(alpha*100)} (1g)": cvar}
+        if c != bench and bench in p:
+            pair = p[[c, bench]].dropna().pct_change().dropna()  # ortak tarihler
+            if len(pair) > 1:
+                row["Tracking error"] = (pair[c] - pair[bench]).std() * np.sqrt(ppy)
+        rows[c] = row
+    return pd.DataFrame(rows).T
+
+
+def consistency_checks(p):
+    rows = {}
+    for c in p:
+        s = p[c].dropna()
+        if len(s) < 3:
+            continue
+        r = s.pct_change().dropna()
+        total = s.iloc[-1] / s.iloc[0] - 1
+        chain = (1 + r).prod() - 1
+        logv = np.expm1(np.log1p(r).sum())
+        days = (s.index[-1] - s.index[0]).days
+        gaps = s.index.to_series().diff().dt.days.dropna()
+        maxgap = int(gaps.max())
+        expected = len(pd.bdate_range(s.index[0], s.index[-1]))
+        big = r.abs().idxmax()
+        diff = max(abs(total - chain), abs(total - logv))
+        status = "Tutarlı" if diff < 1e-9 else "Kontrol et"
+        if maxgap > 10:
+            status += " | veri boşluğu"
+        rows[c] = {
+            "Durum": status,
+            "Fiyattan dönem getirisi": total,
+            "Zincirleme getiri": chain,
+            "Log toplamından getiri": logv,
+            "Fark": diff,
+            "Yıllık (takvim günü)": (1 + total) ** (365.25 / days) - 1,
+            "Yıllık (252 gün varsayımı)": (1 + total) ** (TD / len(r)) - 1,
+            "Gözlem": len(s),
+            "Eksik iş günü": expected - len(s),
+            "En uzun boşluk (gün)": maxgap,
+            "En büyük günlük hareket": r.loc[big],
+            "Tarihi": big.strftime("%d.%m.%Y"),
+        }
+    return pd.DataFrame(rows).T
+
+
+def flow_table(w):
+    """Fon büyüklüğü, yatırımcı sayısı, tahmini net akış (Δpay x fiyat)."""
+    if "number_of_shares" not in w:
+        return None, None
+    sh = w["number_of_shares"].ffill()
+    pr = w["price"].ffill()
+    flow = sh.diff().mul(pr)
+    last = flow.index[-1]
+    m1 = last - pd.DateOffset(months=1)
+    aum = w["market_cap"].ffill() if "market_cap" in w else sh * pr
+    rows = {}
+    for c in pr:
+        a = aum[c].dropna()
+        row = {"Fon büyüklüğü (TL)": a.iloc[-1],
+               "Büyüklük değişimi (1 Ay)": a.iloc[-1] / a.asof(m1) - 1
+               if pd.notna(a.asof(m1)) else np.nan,
+               "Net akış (1 Ay, TL)": flow.loc[flow.index > m1, c].sum()}
+        if "number_of_investors" in w:
+            inv = w["number_of_investors"][c].dropna()
+            row["Yatırımcı sayısı"] = inv.iloc[-1]
+            row["Yatırımcı değişimi (1 Ay)"] = inv.iloc[-1] / inv.asof(m1) - 1 \
+                if pd.notna(inv.asof(m1)) else np.nan
+        rows[c] = row
+    return pd.DataFrame(rows).T, flow.cumsum()
+
+
+def detect_anomalies(p, window=60, z=3.0):
+    R = returns_df(p)
+    zs = (R - R.rolling(window, min_periods=30).mean()) / \
+        R.rolling(window, min_periods=30).std()
+    out = zs.stack().rename("z").reset_index()
+    out.columns = ["Tarih", "Fon", "z"]
+    out["Getiri"] = [R.loc[d, f] for d, f in zip(out["Tarih"], out["Fon"])]
+    return out[out["z"].abs() >= z].sort_values("Tarih", ascending=False)
+
+
+# ---------- Yatırımcı karşılaştırması ----------
+PERIODS = {"1 Ay": pd.DateOffset(months=1), "3 Ay": pd.DateOffset(months=3),
+           "6 Ay": pd.DateOffset(months=6), "1 Yıl": pd.DateOffset(years=1),
+           "Tüm veri": None}
+
+
+def tl(x):
+    return f"{x:,.0f}".replace(",", ".") + " TL"
+
+
+def pc(x):
+    s = f"%{abs(x) * 100:.2f}".replace(".", ",")
+    return ("-" + s) if x < 0 else s
+
+
+def signed_tl(x):
+    return ("+" if x >= 0 else "-") + tl(abs(x))
+
+
+TR_MAP = str.maketrans("İıŞşĞğÜüÖöÇç", "IISSGGUUOOCC")
+DEFAULT_STOPAJ = 0.175  # gerçek kişi, genel yatırım fonu (9 Temmuz 2025 kararı); değişebilir
+
+
+def auto_stopaj(title):
+    """Fon adından tahmini stopaj oranı. Kesin sınıflandırma için KAP/izahname kontrol edilmeli."""
+    t = str(title).translate(TR_MAP).upper()
+    if "HISSE SENEDI YOGUN" in t or "HISSE YOGUN" in t:
+        return 0.0, "hisse senedi yoğun"
+    if "GAYRIMENKUL YATIRIM" in t or "GIRISIM SERMAYESI" in t:
+        return DEFAULT_STOPAJ, "GYF/GSYF (2 yıldan uzun elde tutulursa %0)"
+    return DEFAULT_STOPAJ, "genel oran"
+
+
+def investor_metrics(p, funds, amount, offset, rf, rates, buy_fee=0.0, sell_fee=0.0):
+    """Tutarın tamamı her fonda değerlendirilseydi: brüt, stopaj, masraf, net sonuç."""
+    last = p.index[-1]
+    rows = {}
+    for c in funds:
+        s = p[c].dropna()
+        if len(s) < 5:
+            continue
+        if offset is None:
+            seg = s
+        else:
+            before = s.index[s.index <= last - offset]
+            seg = s[s.index >= before[-1]] if len(before) else s
+        days = (seg.index[-1] - seg.index[0]).days
+        if days < 5:
+            continue
+        r = seg.pct_change().dropna()
+        total = seg.iloc[-1] / seg.iloc[0] - 1
+        ppy = obs_per_year(seg)
+        enough = len(r) >= 10
+        vol = r.std() * np.sqrt(ppy) if enough else np.nan
+        rf_d = (1 + rf) ** (1 / ppy) - 1
+        ex = r - rf_d
+        sharpe = ex.mean() / ex.std() * np.sqrt(ppy) if enough and ex.std() > 0 else np.nan
+        dd = (seg / seg.cummax() - 1).min()
+        roll = seg.pct_change(21).dropna()          # ~1 aylık (21 gözlem) getiriler
+        p5 = np.percentile(roll, 5) if len(roll) >= 20 else np.nan
+        # Vergi ve masraf: stopaj yalnızca kazançtan, satışta kesilir
+        net_in = amount * (1 - buy_fee)
+        gross_val = net_in * (1 + total)
+        gross_gain = gross_val - net_in
+        rate = rates.get(c, DEFAULT_STOPAJ)
+        stopaj = max(gross_gain, 0.0) * rate
+        cost = amount * buy_fee + gross_val * sell_fee
+        net_val = gross_val - stopaj - gross_val * sell_fee
+        rows[c] = {
+            "Brüt fon getirisi": total,
+            "Brüt dönem sonu değer (TL)": gross_val,
+            "Brüt kâr/zarar (TL)": gross_gain,
+            "Stopaj oranı": rate,
+            "Stopaj (TL)": stopaj,
+            "Masraf (TL)": cost,
+            "Net elde edilen (TL)": net_val,
+            "Net kâr/zarar (TL)": net_val - amount,
+            "Net getiri": net_val / amount - 1,
+            "Yıllık volatilite": vol,
+            "Maks. düşüş": dd,
+            "Maks. düşüş (TL)": amount * dd,
+            "Kötü ay %5 (getiri)": p5,
+            "Kötü ay %5 (TL)": amount * p5 if pd.notna(p5) else np.nan,
+            "Sharpe": sharpe,
+            "Başlangıç tarihi": seg.index[0].strftime("%d.%m.%Y"),
+            "Gün": days,
+        }
+    return pd.DataFrame(rows).T
+
+
+def investor_text(m, amount, label, rf):
+    m = m.dropna(subset=["Net getiri"])
+    if len(m) < 2:
+        return ["Karşılaştırma için en az iki fonda yeterli veri yok."]
+    out = []
+    top, low = m["Net getiri"].idxmax(), m["Net getiri"].idxmin()
+    g = m.loc[top]
+    out.append(
+        f"**Net getiri (stopaj ve masraf sonrası):** Geçmişte {label} içinde {tl(amount)} "
+        f"yalnızca **{top}** fonunda değerlendirilmiş olsaydı: brüt kâr/zarar "
+        f"{signed_tl(g['Brüt kâr/zarar (TL)'])}, stopaj {tl(g['Stopaj (TL)'])} "
+        f"({pc(g['Stopaj oranı'])}), masraf {tl(g['Masraf (TL)'])}; elinize geçen yaklaşık "
+        f"**{tl(g['Net elde edilen (TL)'])}** (net {pc(g['Net getiri'])}, "
+        f"{signed_tl(g['Net kâr/zarar (TL)'])}). En düşük net getiri **{low}** fonunda "
+        f"olurdu: {pc(m.loc[low, 'Net getiri'])} "
+        f"({signed_tl(m.loc[low, 'Net kâr/zarar (TL)'])}).")
+    top_gross = m["Brüt fon getirisi"].idxmax()
+    if top_gross != top:
+        out.append(
+            f"Brüt getiride ilk sıradaki fon **{top_gross}** ({pc(m.loc[top_gross, 'Brüt fon getirisi'])}) "
+            f"iken, stopaj ve masraflar sonrasında ilk sıra **{top}** fonuna geçmiştir.")
+    parts = [f"{c}: stopaj {pc(m.loc[c, 'Stopaj oranı'])} = {tl(m.loc[c, 'Stopaj (TL)'])}, "
+             f"masraf {tl(m.loc[c, 'Masraf (TL)'])}" for c in m.index]
+    out.append("**Stopaj ve masraf özeti:** " + "; ".join(parts) + ".")
+    lv = m["Yıllık volatilite"].dropna()
+    dd = m["Maks. düşüş"].dropna()
+    safe = lv.idxmin() if len(lv) else None
+    if safe is not None:
+        risky = lv.idxmax()
+        txt = (f"**Risk:** Fiyat dalgalanması en düşük fon **{safe}** "
+               f"(yıllık volatilite {pc(lv[safe])}), en yüksek fon **{risky}** "
+               f"({pc(lv[risky])}).")
+        if len(dd):
+            sdd, rdd = dd.idxmax(), dd.idxmin()
+            txt += (f" Dönem içindeki en büyük değer kaybı **{sdd}** fonunda en az "
+                    f"({pc(dd[sdd])}, yaklaşık {tl(abs(m.loc[sdd, 'Maks. düşüş (TL)']))}), "
+                    f"**{rdd}** fonunda en fazla olmuştur ({pc(dd[rdd])}, yaklaşık "
+                    f"{tl(abs(m.loc[rdd, 'Maks. düşüş (TL)']))}).")
+        out.append(txt)
+        if top == safe:
+            out.append(f"**{top}** fonu bu dönemde hem en yüksek net getiriyi sağlamış hem de "
+                       "en düşük dalgalanmayı göstermiştir.")
+        else:
+            out.append(
+                f"Bu dönemde en yüksek net getiri ile en düşük risk aynı fonda değildir: "
+                f"daha yüksek net getiri sağlayan **{top}** fonunun volatilitesi "
+                f"{pc(m.loc[top, 'Yıllık volatilite'])}, daha düşük riskli **{safe}** "
+                f"fonunun net getirisi {pc(m.loc[safe, 'Net getiri'])} olmuştur.")
+    sh = m["Sharpe"].dropna()
+    if len(sh):
+        best = sh.idxmax()
+        txt = (f"**Risk başına getiri (Sharpe, brüt):** en yüksek değer **{best}** fonunda "
+               f"({sh[best]:.2f}).")
+        if sh.max() < 0:
+            txt += (f" Hiçbir fonun getirisi {pc(rf)} yıllık risksiz oran varsayımını "
+                    "aşamamıştır, bu nedenle Sharpe değerleri negatiftir.")
+        out.append(txt)
+    out.append("Bu değerlendirme yalnızca geçmiş verilere dayanır; gelecekteki getiri veya "
+               "riskin göstergesi ya da garantisi değildir. Stopaj, satışta kazanç üzerinden "
+               "kesilir ve oranlar fon adından tahmin edilmiştir; kesin oran fonun izahnamesi "
+               "ve güncel mevzuattan teyit edilmelidir. Fon yönetim ücreti fon fiyatına "
+               "dahildir. Enflasyon etkisi dahil değildir. Yatırım tavsiyesi niteliği taşımaz.")
+    return out
+
+
+# ---------- Tema ve görünüm (açık, kurumsal) ----------
+from string import Template
+
+THEMES = {
+    "Açık": dict(
+        bg="#ffffff", card="#ffffff", card2="#eff4ff", sidebar="#f8fafc", border="#e5e7eb",
+        text="#111827", muted="#6b7280", accent="#1d4ed8", up="#15803d", down="#b91c1c",
+        upbg="#dcfce7", downbg="#fee2e2", flatbg="#f3f4f6",
+        palette=["#1d4ed8", "#0d9488", "#d97706", "#7c3aed", "#dc2626", "#0891b2",
+                 "#4b5563", "#be185d"],
+        font="'Inter','Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif",
+        chartfont="Inter", radius="10px", cr=3,
+        hdrbg="linear-gradient(135deg,#f8fafc 0%,#eef2f7 100%)"),
+}
+
+CSS_TMPL = Template("""
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+.stApp {background:$bg; color:$text; font-family:$font;}
+.block-container {padding-top:1.4rem; max-width:1250px;}
+h1, h2, h3, h4, h5, h6 {color:$text !important; font-family:$font !important; font-weight:600;}
+h5 {color:$muted !important; font-size:0.76rem !important; text-transform:uppercase;
+  letter-spacing:1.1px; margin-top:0.8rem; margin-bottom:0.2rem;}
+.stApp p, .stApp label, .stMarkdown {color:$text;}
+div[data-testid="stCaptionContainer"] {color:$muted !important;}
+section[data-testid="stSidebar"] {background:$sidebar; border-right:1px solid $border;}
+div[data-baseweb="input"] > div, div[data-baseweb="select"] > div {background:#ffffff !important;
+  border-color:$border !important;}
+div[data-baseweb="input"] input, div[data-baseweb="select"] div {color:$text !important;}
+div[data-testid="stExpander"] {border:1px solid $border; border-radius:$radius;}
+button[data-baseweb="tab"] {color:$muted; border-radius:999px; padding:6px 14px; margin-right:4px;}
+button[data-baseweb="tab"][aria-selected="true"] {color:$accent; background:$card2;}
+div[data-baseweb="tab-highlight"] {background:$accent !important;}
+div[data-baseweb="tab-border"] {background:$border !important;}
+div[data-testid="stMetric"] {background:$card; border:1px solid $border; border-radius:$radius;
+  padding:14px 16px; box-shadow:0 1px 2px rgba(16,24,40,0.06);}
+div[data-testid="stMetricLabel"] p {color:$muted; font-size:0.72rem; text-transform:uppercase;
+  letter-spacing:1px;}
+div[data-testid="stMetricValue"] {color:$text; font-weight:700;}
+.hdr {display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;
+  background:$hdrbg; border:1px solid $border; border-radius:$radius; padding:16px 20px;
+  margin-bottom:14px;}
+.brand {font-size:22px; font-weight:700; color:$text;}
+.sub {color:$muted; font-size:13px; margin-top:2px;}
+.date {color:$muted; font-size:12px; margin-left:8px;}
+.pill {display:inline-block; padding:3px 10px; border-radius:999px; font-size:11px;
+  font-weight:600; letter-spacing:0.6px;}
+.pill.live {background:$upbg; color:$up;}
+.pill.demo {background:$flatbg; color:$muted;}
+.tk-wrap {display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:10px;
+  margin-bottom:14px;}
+.tk {background:$card; border:1px solid $border; border-top:3px solid $accent;
+  border-radius:$radius; padding:12px 14px; box-shadow:0 1px 2px rgba(16,24,40,0.06);}
+.tk.up {border-top-color:$up;} .tk.down {border-top-color:$down;}
+.tk .code {color:$muted; font-size:12px; font-weight:600; letter-spacing:1px;}
+.tk .px {color:$text; font-size:20px; font-weight:700; font-variant-numeric:tabular-nums;
+  margin:2px 0 8px;}
+.chips {display:flex; gap:6px; flex-wrap:wrap;}
+.chip {font-size:11px; padding:2px 8px; border-radius:999px; font-weight:600;}
+.chip.up {background:$upbg; color:$up;}
+.chip.down {background:$downbg; color:$down;}
+.chip.flat {background:$flatbg; color:$muted;}
+""")
+
+
+def make_css(th):
+    return "<style>" + CSS_TMPL.substitute(th) + "</style>"
+
+
+def pal(th, n):
+    return [th["palette"][i % len(th["palette"])] for i in range(n)]
+
+
+def _chip(label, x):
+    if x is None or pd.isna(x):
+        return f"<span class='chip flat'>{label} -</span>"
+    cls = "up" if x >= 0 else "down"
+    arrow = "▲" if x >= 0 else "▼"
+    return f"<span class='chip {cls}'>{label} {arrow}{abs(x) * 100:.2f}%</span>"
+
+
+def ticker_html(p):
+    """Her fon için son fiyat ve 1G / 1A / YBB değişim kartları."""
+    last = p.index[-1]
+    ytd_ref = pd.Timestamp(year=last.year - 1, month=12, day=31)
+    cards = []
+    for c in p:
+        s = p[c].dropna()
+        if len(s) < 2:
+            continue
+        d1 = s.iloc[-1] / s.iloc[-2] - 1
+        m_ref = s.asof(last - pd.DateOffset(months=1))
+        m1 = s.iloc[-1] / m_ref - 1 if pd.notna(m_ref) else np.nan
+        y_ref = s.asof(ytd_ref)
+        ytd = s.iloc[-1] / y_ref - 1 if pd.notna(y_ref) else np.nan
+        direction = "up" if d1 >= 0 else "down"
+        cards.append(
+            f"<div class='tk {direction}'><div class='code'>{c}</div>"
+            f"<div class='px'>{s.iloc[-1]:,.4f}</div>"
+            f"<div class='chips'>{_chip('1G', d1)}{_chip('1A', m1)}{_chip('YBB', ytd)}</div></div>")
+    return "<div class='tk-wrap'>" + "".join(cards) + "</div>"
+
+
+# ---------- Grafikler (Altair) ----------
+def _style_alt(ch, title, th, height=230):
+    ch = ch.properties(title=title, height=height, background=th["bg"])
+    return (ch.configure_axis(labelColor=th["muted"], titleColor=th["muted"],
+                              gridColor=th["border"], domain=False, ticks=False,
+                              labelFont=th["chartfont"], titleFont=th["chartfont"],
+                              labelFontSize=11)
+              .configure_axisX(grid=False)
+              .configure_view(stroke=None)
+              .configure_title(color=th["text"], anchor="start", font=th["chartfont"],
+                               fontSize=13, fontWeight=600)
+              .configure_legend(labelColor=th["text"], titleColor=th["muted"],
+                                labelFont=th["chartfont"], labelFontSize=11))
+
+
+def line_chart(df, th, title="", fmt=",.0f", height=230):
+    """Çok serili çizgi grafik; df: tarih indeksli, sütunlar = seri."""
+    import altair as alt
+    long = (df.rename_axis("Tarih").reset_index()
+              .melt(id_vars="Tarih", var_name="Fon", value_name="Deger").dropna())
+    order = list(df.columns)
+    ch = alt.Chart(long).mark_line(strokeWidth=2).encode(
+        x=alt.X("Tarih:T", title=None),
+        y=alt.Y("Deger:Q", title=None, scale=alt.Scale(zero=False), axis=alt.Axis(format=fmt)),
+        color=alt.Color("Fon:N", sort=order,
+                        scale=alt.Scale(domain=order, range=pal(th, len(order))),
+                        legend=alt.Legend(title=None, orient="top")),
+        tooltip=[alt.Tooltip("Tarih:T", format="%d.%m.%Y"), "Fon:N",
+                 alt.Tooltip("Deger:Q", format=fmt)])
+    return _style_alt(ch, title, th, height)
+
+
+def stacked_area(df, th, title="", fmt=",.0f", height=230):
+    """Yığılmış alan grafiği (üst çizgi toplamı verir)."""
+    import altair as alt
+    long = (df.rename_axis("Tarih").reset_index()
+              .melt(id_vars="Tarih", var_name="Fon", value_name="Deger").dropna())
+    order = list(df.columns)
+    ch = alt.Chart(long).mark_area(opacity=0.9).encode(
+        x=alt.X("Tarih:T", title=None),
+        y=alt.Y("Deger:Q", stack=True, title=None, axis=alt.Axis(format=fmt)),
+        color=alt.Color("Fon:N", sort=order,
+                        scale=alt.Scale(domain=order, range=pal(th, len(order))),
+                        legend=alt.Legend(title=None, orient="top")),
+        tooltip=[alt.Tooltip("Tarih:T", format="%d.%m.%Y"), "Fon:N",
+                 alt.Tooltip("Deger:Q", format=fmt)])
+    return _style_alt(ch, title, th, height)
+
+
+def bar_pos_neg(df, x, y, title, th, fmt=".1%", height=230):
+    """Pozitif yeşil, negatif kırmızı çubuklar; değer etiketli."""
+    import altair as alt
+    order = list(df.sort_values(y, ascending=False)[x])
+    base = alt.Chart(df).encode(x=alt.X(f"{x}:N", sort=order, title=None,
+                                        axis=alt.Axis(labelAngle=0)))
+    bars = base.mark_bar(cornerRadiusEnd=th["cr"], size=28).encode(
+        y=alt.Y(f"{y}:Q", title=None, axis=alt.Axis(format=fmt)),
+        color=alt.condition(f"datum.{y} >= 0", alt.value(th["up"]), alt.value(th["down"])),
+        tooltip=[x, alt.Tooltip(f"{y}:Q", format=fmt)])
+    pos = (base.mark_text(dy=-8, fontSize=11, color=th["text"])
+               .encode(y=alt.Y(f"{y}:Q"), text=alt.Text(f"{y}:Q", format=fmt))
+               .transform_filter(f"datum.{y} >= 0"))
+    neg = (base.mark_text(dy=10, fontSize=11, color=th["text"])
+               .encode(y=alt.Y(f"{y}:Q"), text=alt.Text(f"{y}:Q", format=fmt))
+               .transform_filter(f"datum.{y} < 0"))
+    return _style_alt(bars + pos + neg, title, th, height)
+
+
+def scatter_chart(df, th, title="Risk / Getiri", height=230):
+    """df sütunları: Fon, Vol, Getiri."""
+    import altair as alt
+    base = alt.Chart(df).encode(
+        x=alt.X("Vol:Q", title="Yıllık volatilite", axis=alt.Axis(format=".0%")),
+        y=alt.Y("Getiri:Q", title="Yıllık getiri", axis=alt.Axis(format=".0%")))
+    pts = base.mark_circle(size=140, color=th["accent"], opacity=0.9).encode(
+        tooltip=["Fon", alt.Tooltip("Vol:Q", format=".2%"),
+                 alt.Tooltip("Getiri:Q", format=".2%")])
+    txt = base.mark_text(dy=-14, color=th["text"], font=th["chartfont"],
+                         fontSize=11).encode(text="Fon:N")
+    return _style_alt(pts + txt, title, th, height)
+
+
+def donut_chart(df, label, value, th, title="", height=270):
+    """Daire (halka) grafik; oranlar dilim üzerinde gösterilir."""
+    import altair as alt
+    d = df[[label, value]].copy()
+    d = d[d[value] > 0]
+    d["Oran"] = d[value] / d[value].sum()
+    order = list(d.sort_values(value, ascending=False)[label])
+    base = alt.Chart(d).encode(
+        theta=alt.Theta(f"{value}:Q", stack=True),
+        order=alt.Order(f"{value}:Q", sort="descending"),
+        color=alt.Color(f"{label}:N", sort=order,
+                        scale=alt.Scale(domain=order, range=pal(th, len(order))),
+                        legend=alt.Legend(title=None, orient="bottom")))
+    arcs = base.mark_arc(innerRadius=56, outerRadius=98, stroke="#ffffff",
+                         strokeWidth=2).encode(
+        tooltip=[label, alt.Tooltip(f"{value}:Q", format=",.0f"),
+                 alt.Tooltip("Oran:Q", format=".1%")])
+    txt = (base.mark_text(radius=116, size=11, color=th["text"])
+               .encode(text=alt.Text("Oran:Q", format=".0%"))
+               .transform_filter("datum.Oran >= 0.04"))
+    return _style_alt(arcs + txt, title, th, height)
+
+
+def corr_heatmap(corr, th, title=""):
+    """Korelasyon ısı haritası (kırmızı negatif, mavi pozitif)."""
+    import altair as alt
+    order = list(corr.columns)
+    cl = (corr.rename_axis("A").reset_index()
+              .melt(id_vars="A", var_name="B", value_name="Kor"))
+    base = alt.Chart(cl).encode(
+        x=alt.X("B:N", sort=order, title=None, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("A:N", sort=order, title=None))
+    rect = base.mark_rect(stroke="#ffffff", strokeWidth=2).encode(
+        color=alt.Color("Kor:Q", legend=None,
+                        scale=alt.Scale(domain=[-1, 0, 1],
+                                        range=["#b91c1c", "#f8fafc", "#1d4ed8"])),
+        tooltip=["A", "B", alt.Tooltip("Kor:Q", format=".2f")])
+    txt = base.mark_text(fontSize=12).encode(
+        text=alt.Text("Kor:Q", format=".2f"),
+        color=alt.condition("abs(datum.Kor) > 0.6", alt.value("#ffffff"),
+                            alt.value("#111827")))
+    return _style_alt(rect + txt, title, th, height=max(170, 46 * len(order) + 40))
+
+
+# ---------- Portföy sepeti ----------
+def basket_analysis(p, amounts, offset, rates, buy_fee=0.0, sell_fee=0.0, alpha=0.95):
+    """Fon başına tutar girilen sepetin (al-tut, yeniden dengeleme yok) analizi."""
+    funds = [c for c, a in amounts.items() if a and a > 0 and c in p.columns]
+    if not funds:
+        return None
+    sub = p[funds].dropna()                      # ortak tarihler
+    if offset is not None and len(sub):
+        before = sub.index[sub.index <= sub.index[-1] - offset]
+        if len(before):
+            sub = sub[sub.index >= before[-1]]
+    if len(sub) < 10:
+        return None
+    amt = pd.Series({c: float(amounts[c]) for c in funds})
+    w = amt / amt.sum()
+    value = sub.mul(amt / sub.iloc[0], axis=1)   # her fonun TL değeri
+    total = value.sum(axis=1)
+    r = total.pct_change().dropna()
+    days = (sub.index[-1] - sub.index[0]).days
+    ppy = (len(sub) - 1) / (days / 365.25) if days > 0 else float(TD)
+    vol = r.std() * np.sqrt(ppy)
+    dd = (total / total.cummax() - 1).min()
+    var = -np.percentile(r, (1 - alpha) * 100)
+    cvar = -r[r <= -var].mean()
+    cov = sub.pct_change().dropna().cov().values * ppy
+    wv = w.values
+    pv = float(wv @ cov @ wv)
+    if pv > 0:
+        rc = (wv * (cov @ wv)) / pv              # risk katkısı, toplamı 1
+        div = float((wv * np.sqrt(np.diag(cov))).sum() / np.sqrt(pv))
+    else:
+        rc, div = np.full(len(funds), np.nan), np.nan
+    fret = sub.iloc[-1] / sub.iloc[0] - 1
+    net_in = amt * (1 - buy_fee)
+    gross = net_in * (1 + fret)
+    gain = gross - net_in
+    rate = pd.Series({c: rates.get(c, DEFAULT_STOPAJ) for c in funds})
+    stopaj = gain.clip(lower=0) * rate           # stopaj yalnızca kazançtan, fon bazında
+    sell = gross * sell_fee
+    net_val = gross - stopaj - sell
+    table = pd.DataFrame({
+        "Tutar (TL)": amt, "Ağırlık": w, "Dönem getirisi": fret,
+        "Risk katkısı": pd.Series(rc, index=funds),
+        "Brüt değer (TL)": gross, "Stopaj (TL)": stopaj,
+        "Masraf (TL)": amt * buy_fee + sell, "Net değer (TL)": net_val,
+        "Net kâr/zarar (TL)": net_val - amt})
+    return {"table": table, "value": value, "total": total,
+            "ret": total.iloc[-1] / total.iloc[0] - 1, "vol": vol, "dd": dd,
+            "var": var, "cvar": cvar, "div": div, "start": sub.index[0],
+            "alpha": alpha}
+
+
+def basket_text(res, label):
+    t = res["table"]
+    tot = t["Tutar (TL)"].sum()
+    out = []
+    parts = [f"**{c}** {pc(t.loc[c, 'Ağırlık'])} ({tl(t.loc[c, 'Tutar (TL)'])})"
+             for c in t.sort_values("Tutar (TL)", ascending=False).index]
+    out.append(f"**Sepet:** Toplam {tl(tot)} şöyle dağılmıştır: " + ", ".join(parts) + ".")
+    net_total = t["Net değer (TL)"].sum()
+    out.append(
+        f"**Getiri:** Geçmişte {label} içinde (ortak veri başlangıcı "
+        f"{res['start']:%d.%m.%Y}) bu sepetin brüt getirisi {pc(res['ret'])} olurdu. "
+        f"Stopaj {tl(t['Stopaj (TL)'].sum())} ve masraf {tl(t['Masraf (TL)'].sum())} "
+        f"sonrasında elinize geçen yaklaşık **{tl(net_total)}** "
+        f"({pc(net_total / tot - 1)}, {signed_tl(net_total - tot)}).")
+    out.append(
+        f"**Risk:** Sepetin yıllık volatilitesi {pc(res['vol'])}; dönem içindeki en büyük "
+        f"değer kaybı {pc(res['dd'])} (yaklaşık {tl(abs(res['dd']) * tot)}). Tarihsel "
+        f"verilerde günlük kayıp, %{int(res['alpha'] * 100)} güven düzeyinde "
+        f"{pc(res['var'])} ({tl(res['var'] * tot)}) seviyesinin altında kalmıştır.")
+    if pd.notna(res["div"]):
+        if res["div"] > 1.05:
+            out.append(f"**Çeşitlendirme:** Oran {res['div']:.2f}. Sepet riski, fonların "
+                       f"ağırlıklı ortalama riskinden yaklaşık %{(1 - 1 / res['div']) * 100:.0f} "
+                       "daha düşüktür; fonlar birbirini kısmen dengeliyor.")
+        else:
+            out.append(f"**Çeşitlendirme:** Oran {res['div']:.2f}; fonlar benzer yönde "
+                       "hareket ettiği için çeşitlendirme faydası sınırlıdır.")
+    rc = t["Risk katkısı"].dropna()
+    if len(rc) > 1:
+        top = rc.idxmax()
+        if rc[top] > t.loc[top, "Ağırlık"] + 0.05:
+            out.append(f"**Risk yoğunlaşması:** **{top}** fonu tutarın {pc(t.loc[top, 'Ağırlık'])}"
+                       f"'ini oluşturuyor, ancak sepet riskinin {pc(rc[top])}'ini taşıyor.")
+        else:
+            out.append("**Risk dağılımı:** Fonların risk payları tutar paylarıyla büyük "
+                       "ölçüde uyumludur.")
+    pr = t["Net kâr/zarar (TL)"]
+    if len(pr) > 1:
+        out.append(f"**Katkı:** Net sonuca en çok katkı veren fon **{pr.idxmax()}** "
+                   f"({signed_tl(pr.max())}), en az katkı veren **{pr.idxmin()}** "
+                   f"({signed_tl(pr.min())}).")
+    out.append("Değerlendirme geçmiş verilere dayanır, gelecekteki getiri veya riskin "
+               "garantisi değildir; yatırım tavsiyesi niteliği taşımaz. Sepet, al-tut "
+               "varsayımıyla (yeniden dengeleme olmadan) hesaplanmıştır. Stopaj oranlarını "
+               "izahnameden teyit ediniz.")
+    return out
+
+
+# ---------- Haftalık fon bülteni ----------
+UNIV_COLS = [
+    ["code", "date", "price", "market_cap", "number_of_investors", "title"],
+    ["code", "date", "price", "title"],
+    ["code", "date", "price"],
+]
+PERIOD_DAYS = {"Son 1 hafta": 7, "Son 2 hafta": 14, "Son 1 ay": 30}
+KIND_LABELS = {"YAT": "Yatırım fonları", "EMK": "Emeklilik fonları",
+               "BYF": "Borsa yatırım fonları"}
+BUL_FMT = {"Fiyat": "{:,.4f}", "Getiri": "{:.2%}", "Fon büyüklüğü (TL)": "{:,.0f}",
+           "Net akış (TL)": "{:,.0f}", "Yatırımcı": "{:,.0f}",
+           "Yatırımcı değişimi": "{:+,.0f}", "Yatırımcı değişimi (%)": "{:.2%}"}
+
+
+def trnum(x, d=0):
+    return f"{x:,.{d}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def pcn(x):
+    return "-" if pd.isna(x) else pc(x)
+
+
+def _fetch_day(crawler, d, kind, errs):
+    """Bir iş gününde tüm fonların verisi; veri yoksa None."""
+    if d.weekday() >= 5:
+        return None
+    ds = d.strftime("%Y-%m-%d")
+    for cols in UNIV_COLS:
+        try:
+            kw = dict(start=ds, end=ds, columns=cols)
+            if kind != "YAT":
+                kw["kind"] = kind
+            df = crawler.fetch(**kw)
+        except Exception as e:
+            errs.append(str(e))
+            continue
+        return df if df is not None and len(df) else None
+    return None
+
+
+@st.cache_data(show_spinner="TEFAS tüm fon verisi çekiliyor (1-2 dakika sürebilir)...",
+               ttl=3600)
+def load_universe(kind, end_str, days):
+    from tefas import Crawler
+    crawler = Crawler()
+    errs, end = [], pd.Timestamp(end_str)
+    df_last = last_d = None
+    for back in range(8):
+        d = end - pd.Timedelta(days=back)
+        df_last = _fetch_day(crawler, d, kind, errs)
+        if df_last is not None:
+            last_d = d
+            break
+    if df_last is None:
+        raise RuntimeError("TEFAS'tan tüm fon verisi alınamadı. "
+                           + (errs[-1] if errs else "Son günlerde veri bulunamadı."))
+    target = last_d - pd.Timedelta(days=days)
+    df_ref = ref_d = None
+    for back in range(8):
+        d = target - pd.Timedelta(days=back)
+        df_ref = _fetch_day(crawler, d, kind, errs)
+        if df_ref is not None:
+            ref_d = d
+            break
+    if df_ref is None:
+        raise RuntimeError("Karşılaştırma tarihi için TEFAS verisi alınamadı.")
+    return df_last, df_ref, last_d, ref_d
+
+
+def synthetic_universe(days, end_str, n=80, seed=7):
+    """Demo modu için sentetik fon evreni (iki tarih)."""
+    rng = np.random.default_rng(seed)
+    last_d = pd.Timestamp(end_str)
+    while last_d.weekday() >= 5:
+        last_d -= pd.Timedelta(days=1)
+    ref_d = last_d - pd.Timedelta(days=days)
+    while ref_d.weekday() >= 5:
+        ref_d -= pd.Timedelta(days=1)
+    codes = [f"F{i:03d}" for i in range(1, n + 1)]
+    p0, ret = rng.uniform(1, 200, n), rng.normal(0.004, 0.03, n)
+    sh0, sh_g = rng.lognormal(15, 1.2, n), rng.normal(0.01, 0.08, n)
+    inv0, inv_g = rng.integers(50, 80000, n).astype(float), rng.normal(0.01, 0.06, n)
+
+    def mk(d, p, sh, inv):
+        return pd.DataFrame({"code": codes, "date": d, "price": p, "market_cap": p * sh,
+                             "number_of_investors": inv.round(),
+                             "title": [f"DEMO FON {c}" for c in codes]})
+    return (mk(last_d, p0 * (1 + ret), sh0 * (1 + sh_g), inv0 * (1 + inv_g)),
+            mk(ref_d, p0, sh0, inv0), last_d, ref_d)
+
+
+def bulletin_frame(df_last, df_ref):
+    """İki tarih arasındaki getiri, yatırımcı değişimi ve tahmini net akış."""
+    def prep(df):
+        d = df.copy()
+        for c in ["price", "market_cap", "number_of_investors"]:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+        return d.drop_duplicates("code").set_index("code")
+    a, b = prep(df_last), prep(df_ref)
+    idx = a.index.intersection(b.index)
+    a, b = a.loc[idx], b.loc[idx]
+    out = pd.DataFrame(index=idx)
+    out.index.name = "Fon"
+    out["Fon adı"] = a["title"] if "title" in a.columns else ""
+    out["Fiyat"] = a["price"]
+    out["Getiri"] = (a["price"] / b["price"] - 1).where(b["price"] > 0)
+    if "market_cap" in a.columns and "market_cap" in b.columns:
+        out["Fon büyüklüğü (TL)"] = a["market_cap"]
+        sh_a, sh_b = a["market_cap"] / a["price"], b["market_cap"] / b["price"]
+        out["Net akış (TL)"] = (sh_a - sh_b) * a["price"]
+    if "number_of_investors" in a.columns and "number_of_investors" in b.columns:
+        ia, ib = a["number_of_investors"], b["number_of_investors"]
+        out["Yatırımcı"] = ia
+        out["Yatırımcı değişimi"] = ia - ib
+        out["Yatırımcı değişimi (%)"] = (ia / ib - 1).where(ib > 0)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def apply_filters(f, min_mc, min_inv):
+    m = pd.Series(True, index=f.index)
+    if "Fon büyüklüğü (TL)" in f.columns:
+        m &= f["Fon büyüklüğü (TL)"].fillna(0) >= min_mc
+    if "Yatırımcı" in f.columns:
+        m &= f["Yatırımcı"].fillna(0) >= min_inv
+    return f[m]
+
+
+def top_n(f, col, n, ascending=False):
+    if col not in f.columns:
+        return f.iloc[0:0]
+    g = f.dropna(subset=[col])
+    g = g[g[col] < 0] if ascending else g[g[col] > 0]   # yükselen/giriş > 0, düşen/çıkış < 0
+    return g.sort_values(col, ascending=ascending).head(n)
+
+
+def bulletin_text(f, last_d, ref_d, n, min_mc, min_inv):
+    """Kopyalanabilir bülten metni."""
+    def nm(code):
+        name = str(f.loc[code, "Fon adı"]) if "Fon adı" in f.columns else ""
+        return f"{code} - {name}" if name and name != "nan" else str(code)
+
+    def sgn(x, suffix=""):
+        return ("+" if x >= 0 else "-") + trnum(abs(x)) + suffix
+
+    L = [f"TEFAS Fon Bülteni | {ref_d:%d.%m.%Y} - {last_d:%d.%m.%Y}", ""]
+
+    def block(title, df, fmt):
+        if df.empty:
+            return
+        L.append(title)
+        for i, (code, r) in enumerate(df.iterrows(), 1):
+            L.append(f"{i}. {nm(code)}: {fmt(r)}")
+        L.append("")
+
+    block("En çok yükselen fonlar (fiyat getirisi)", top_n(f, "Getiri", n),
+          lambda r: pcn(r["Getiri"]))
+    block("En çok düşen fonlar (fiyat getirisi)", top_n(f, "Getiri", n, True),
+          lambda r: pcn(r["Getiri"]))
+    inv_fmt = lambda r: f"{sgn(r['Yatırımcı değişimi'])} kişi ({pcn(r['Yatırımcı değişimi (%)'])})"
+    block("Yatırımcı sayısı en çok artan fonlar (giriş)",
+          top_n(f, "Yatırımcı değişimi", n), inv_fmt)
+    block("Yatırımcı sayısı en çok azalan fonlar (çıkış)",
+          top_n(f, "Yatırımcı değişimi", n, True), inv_fmt)
+    flow_fmt = lambda r: ("+" if r["Net akış (TL)"] >= 0 else "-") + \
+        trnum(abs(r["Net akış (TL)"]) / 1e6, 1) + " mn TL"
+    block("Tahmini net para girişi en yüksek fonlar", top_n(f, "Net akış (TL)", n), flow_fmt)
+    block("Tahmini net para çıkışı en yüksek fonlar",
+          top_n(f, "Net akış (TL)", n, True), flow_fmt)
+    L.append(f"Kapsam: {len(f)} fon (fon büyüklüğü en az {tl(min_mc)}, "
+             f"yatırımcı sayısı en az {trnum(min_inv)}).")
+    L.append("Kaynak: TEFAS. Net akış, pay sayısı değişimi x fiyat ile tahmin edilmiştir. "
+             "Geçmiş performans gelecekteki getirinin garantisi değildir; metin "
+             "bilgilendirme amaçlıdır, yatırım tavsiyesi değildir.")
+    return "\n".join(L)
+
+
+def show_bul_table(df, cols):
+    cols = [c for c in cols if c in df.columns]
+    st.dataframe(df[cols].style.format({k: v for k, v in BUL_FMT.items() if k in cols}),
+                 use_container_width=True)
+
+
+# ---------- Arayüz ----------
+with st.sidebar:
+    st.header("Ayarlar")
+    title = st.text_input("Panel başlığı", "TEFAS Fon Analiz Paneli")
+    codes = [c.strip().upper() for c in
+             st.text_input("Fon kodları (virgülle)", "AFA,TI2,IPB,YAS").split(",")
+             if c.strip()]
+    start = st.date_input("Başlangıç", pd.Timestamp.today() - pd.DateOffset(years=1))
+    end = st.date_input("Bitiş", pd.Timestamp.today())
+    live = st.toggle("Canlı TEFAS verisi", value=True,
+                     help="Kapalıyken sentetik demo verisi kullanılır.")
+    rf = st.number_input("Risksiz oran (yıllık)", 0.0, 1.0, 0.40, 0.01)
+    alpha = st.select_slider("VaR güven düzeyi", [0.90, 0.95, 0.99], 0.95)
+
+th = THEMES["Açık"]
+st.markdown(make_css(th), unsafe_allow_html=True)
+pill = ("<span class='pill live'>● CANLI TEFAS VERİSİ</span>" if live
+        else "<span class='pill demo'>● DEMO VERİ</span>")
+st.markdown(
+    f"<div class='hdr'><div><div class='brand'>{title}</div>"
+    "<div class='sub'>Fon performans, risk ve akış analizi</div></div>"
+    f"<div>{pill}<span class='date'>{pd.Timestamp.today():%d.%m.%Y}</span></div></div>",
+    unsafe_allow_html=True)
+if not codes:
+    st.stop()
+
+try:
+    raw = (load_tefas(tuple(codes), str(start), str(end)) if live
+           else load_synthetic(tuple(codes), str(start), str(end)))
+    w = to_wide(raw)
+except Exception as e:
+    st.error(f"Veri alınamadı: {e}")
+    st.stop()
+
+p = w["price"]
+if p.empty:
+    st.warning("Seçilen tarih aralığında veri yok. Fon kodlarını kontrol et.")
+    st.stop()
+
+bench = st.sidebar.selectbox("Kıyas fonu (tracking error)", list(p.columns))
+st.caption(f"Kaynak: {'TEFAS (canlı)' if live else 'sentetik demo verisi'} | "
+           f"Son veri tarihi: {p.index[-1]:%d.%m.%Y}")
+pf = p.ffill()  # yalnızca grafik çizimi için
+
+titles_all = {}
+if "title" in raw.columns:
+    titles_all = (raw.dropna(subset=["title"]).drop_duplicates("code")
+                  .set_index("code")["title"].to_dict())
+NAMES = ['Home', 'Haftalık bülten', 'Portföy sepeti', 'Yatırımcı karşılaştırma', 'Özet', 'Performans', 'Risk',
+         'Fon büyüklüğü ve akış', 'Anomaliler', 'Metodoloji ve tutarlılık']
+T = dict(zip(NAMES, st.tabs(NAMES)))
+
+with T["Home"]:
+    st.markdown(ticker_html(p), unsafe_allow_html=True)
+    ft_h, _ = flow_table(w)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Fon sayısı", len(p.columns))
+    if "market_cap" in w:
+        k2.metric("Toplam fon büyüklüğü",
+                  f"{w['market_cap'].ffill().iloc[-1].sum() / 1e9:,.2f} mlr TL")
+    else:
+        k2.metric("Toplam fon büyüklüğü", "-")
+    if "number_of_investors" in w:
+        k3.metric("Toplam yatırımcı",
+                  f"{w['number_of_investors'].ffill().iloc[-1].sum():,.0f}")
+    else:
+        k3.metric("Toplam yatırımcı", "-")
+    if ft_h is not None:
+        k4.metric("1 ay net akış (tahmini)",
+                  f"{ft_h['Net akış (1 Ay, TL)'].astype(float).sum() / 1e6:,.1f} mn TL")
+    else:
+        k4.metric("1 ay net akış (tahmini)", "-")
+
+    h1, h2 = st.columns(2)
+    with h1:
+        st.markdown("##### Fiyat performansı (başlangıç = 100)")
+        base_h = p.apply(lambda s: s.dropna().iloc[0])
+        st.altair_chart(line_chart(pf / base_h * 100, th, "", ",.0f"),
+                        use_container_width=True, theme=None)
+    with h2:
+        st.markdown("##### 1 aylık getiri")
+        pr_h = period_returns(p)
+        bm = pr_h["1 Ay"].dropna().astype(float).rename("Getiri").rename_axis("Fon").reset_index()
+        if len(bm):
+            st.altair_chart(bar_pos_neg(bm, "Fon", "Getiri", "", th),
+                            use_container_width=True, theme=None)
+
+    h3, h4 = st.columns(2)
+    with h3:
+        st.markdown("##### Risk / getiri haritası")
+        rt_h = risk_table(p, bench, rf, alpha)
+        if not rt_h.empty:
+            sc = (rt_h[["Yıllık volatilite", "Yıllık getiri"]].astype(float)
+                  .rename(columns={"Yıllık volatilite": "Vol", "Yıllık getiri": "Getiri"})
+                  .rename_axis("Fon").reset_index())
+            st.altair_chart(scatter_chart(sc, th, ""), use_container_width=True, theme=None)
+    with h4:
+        st.markdown("##### 1 aylık tahmini net akış (TL)")
+        if ft_h is not None:
+            nf = ft_h["Net akış (1 Ay, TL)"].astype(float).rename("Akış").rename_axis("Fon").reset_index()
+            st.altair_chart(bar_pos_neg(nf, "Fon", "Akış", "", th, ".2s"),
+                            use_container_width=True, theme=None)
+        else:
+            st.info("Fon büyüklüğü verisi gelmedi, akış grafiği gösterilemiyor.")
+
+    if "market_cap" in w or "number_of_investors" in w:
+        h5, h6 = st.columns(2)
+        with h5:
+            if "market_cap" in w:
+                st.markdown("##### Fon büyüklüğü dağılımı")
+                mc = (w["market_cap"].ffill().iloc[-1].dropna().astype(float)
+                      .rename("Deger").rename_axis("Fon").reset_index())
+                st.altair_chart(donut_chart(mc, "Fon", "Deger", th),
+                                use_container_width=True, theme=None)
+        with h6:
+            if "number_of_investors" in w:
+                st.markdown("##### Yatırımcı sayısı dağılımı")
+                iv = (w["number_of_investors"].ffill().iloc[-1].dropna().astype(float)
+                      .rename("Deger").rename_axis("Fon").reset_index())
+                st.altair_chart(donut_chart(iv, "Fon", "Deger", th),
+                                use_container_width=True, theme=None)
+
+with T["Haftalık bülten"]:
+    st.subheader("Haftalık fon bülteni")
+    st.caption("TEFAS'taki tüm fonlar taranır: en çok yükselen ve düşen fonlar, yatırımcı "
+               "sayısı en çok artan (giriş) ve azalan (çıkış) fonlar, tahmini net akış.")
+    bc1, bc2, bc3 = st.columns(3)
+    bl_per = bc1.selectbox("Dönem", list(PERIOD_DAYS), key="bl_per")
+    bl_kind = bc2.selectbox("Fon türü", list(KIND_LABELS),
+                            format_func=lambda k: KIND_LABELS[k], key="bl_kind")
+    bl_n = bc3.slider("Listedeki fon sayısı", 5, 20, 10, key="bl_n")
+    with st.expander("Filtreler (çok küçük fonların listeyi bozmasını önler)"):
+        f1, f2 = st.columns(2)
+        bl_mc = f1.number_input("En az fon büyüklüğü (mn TL)", 0.0, 1e6, 10.0, 5.0,
+                                key="bl_mc") * 1e6
+        bl_inv = f2.number_input("En az yatırımcı sayısı", 0.0, 1e7, 100.0, 50.0,
+                                 key="bl_inv")
+    if st.button("Bülteni hazırla", type="primary", key="bl_btn"):
+        st.session_state["bl_ready"] = True
+    if not st.session_state.get("bl_ready"):
+        st.info("Ayarları seçip **Bülteni hazırla** düğmesine dokun. Tüm fonların verisi "
+                "çekileceği için ilk açılış biraz sürebilir.")
+    else:
+        bl_data, bl_err = None, None
+        try:
+            today_s = str(pd.Timestamp.today().date())
+            bl_data = (load_universe(bl_kind, today_s, PERIOD_DAYS[bl_per]) if live
+                       else synthetic_universe(PERIOD_DAYS[bl_per], today_s))
+        except Exception as e:
+            bl_err = str(e)
+        if bl_err:
+            st.error(f"Bülten verisi alınamadı: {bl_err}")
+        else:
+            df_last, df_ref, last_d, ref_d = bl_data
+            bf_all = bulletin_frame(df_last, df_ref)
+            bf = apply_filters(bf_all, bl_mc, bl_inv)
+            st.caption(f"Karşılaştırma: {ref_d:%d.%m.%Y} → {last_d:%d.%m.%Y} | "
+                       f"{'TEFAS (canlı)' if live else 'sentetik demo verisi'}")
+            if bf.empty:
+                st.warning("Filtrelere uyan fon yok. Filtreleri gevşetmeyi dene.")
+            else:
+                q1, q2, q3, q4 = st.columns(4)
+                q1.metric("Taranan fon", f"{len(bf_all):,}")
+                q2.metric("Filtre sonrası", f"{len(bf):,}")
+                q3.metric("Medyan getiri", pcn(bf["Getiri"].median()))
+                up_share = (bf["Getiri"].dropna() > 0).mean()
+                q4.metric("Yükselen fon oranı", pcn(up_share))
+                sb = st.tabs(["Getiri", "Yatırımcı giriş/çıkış", "Net akış (TL)",
+                              "Bülten metni"])
+                with sb[0]:
+                    up, dn = top_n(bf, "Getiri", bl_n), top_n(bf, "Getiri", bl_n, True)
+                    mv = (pd.concat([up.head(5), dn.head(5)])[["Getiri"]]
+                          .reset_index().drop_duplicates("Fon"))
+                    st.markdown("##### En çok yükselen ve düşen 5'er fon")
+                    st.altair_chart(bar_pos_neg(mv, "Fon", "Getiri", "", th),
+                                    use_container_width=True, theme=None)
+                    st.markdown("##### En çok yükselen fonlar")
+                    show_bul_table(up, ["Fon adı", "Getiri", "Fiyat",
+                                        "Fon büyüklüğü (TL)", "Yatırımcı"])
+                    st.markdown("##### En çok düşen fonlar")
+                    show_bul_table(dn, ["Fon adı", "Getiri", "Fiyat",
+                                        "Fon büyüklüğü (TL)", "Yatırımcı"])
+                with sb[1]:
+                    if "Yatırımcı değişimi" not in bf.columns:
+                        st.info("TEFAS'tan yatırımcı sayısı gelmedi.")
+                    else:
+                        ia = top_n(bf, "Yatırımcı değişimi", bl_n)
+                        ib = top_n(bf, "Yatırımcı değişimi", bl_n, True)
+                        mv2 = (pd.concat([ia.head(5), ib.head(5)])[["Yatırımcı değişimi"]]
+                               .rename(columns={"Yatırımcı değişimi": "Degisim"})
+                               .reset_index().drop_duplicates("Fon"))
+                        st.markdown("##### Yatırımcı sayısı değişimi (kişi), 5 artan + 5 azalan")
+                        st.altair_chart(bar_pos_neg(mv2, "Fon", "Degisim", "", th, ",.0f"),
+                                        use_container_width=True, theme=None)
+                        cols_i = ["Fon adı", "Yatırımcı", "Yatırımcı değişimi",
+                                  "Yatırımcı değişimi (%)", "Getiri", "Net akış (TL)"]
+                        st.markdown("##### Yatırımcı sayısı en çok artan fonlar (giriş)")
+                        show_bul_table(ia, cols_i)
+                        st.markdown("##### Yatırımcı sayısı en çok azalan fonlar (çıkış)")
+                        show_bul_table(ib, cols_i)
+                with sb[2]:
+                    if "Net akış (TL)" not in bf.columns:
+                        st.info("TEFAS'tan fon büyüklüğü gelmedi, net akış hesaplanamadı.")
+                    else:
+                        fa = top_n(bf, "Net akış (TL)", bl_n)
+                        fb = top_n(bf, "Net akış (TL)", bl_n, True)
+                        mv3 = (pd.concat([fa.head(5), fb.head(5)])[["Net akış (TL)"]]
+                               .rename(columns={"Net akış (TL)": "Akis"})
+                               .reset_index().drop_duplicates("Fon"))
+                        st.markdown("##### Tahmini net akış (TL), 5 giriş + 5 çıkış")
+                        st.altair_chart(bar_pos_neg(mv3, "Fon", "Akis", "", th, ".2s"),
+                                        use_container_width=True, theme=None)
+                        cols_f = ["Fon adı", "Net akış (TL)", "Fon büyüklüğü (TL)",
+                                  "Getiri", "Yatırımcı değişimi"]
+                        st.markdown("##### En yüksek net para girişi")
+                        show_bul_table(fa, cols_f)
+                        st.markdown("##### En yüksek net para çıkışı")
+                        show_bul_table(fb, cols_f)
+                        st.caption("Net akış = (pay sayısı değişimi) x fiyat; pay sayısı "
+                                   "fon büyüklüğü / fiyat ile türetilir. Tahmindir.")
+                with sb[3]:
+                    txt = bulletin_text(bf, last_d, ref_d, min(bl_n, 10), bl_mc, bl_inv)
+                    st.caption("Metni kopyala (sağ üstteki simge) veya indir; "
+                               "LinkedIn/bülten taslağı olarak kullanılabilir.")
+                    st.code(txt, language=None)
+                    st.download_button("Bülten metnini indir (.txt)", txt.encode("utf-8"),
+                                       "tefas_bulten.txt", "text/plain")
+                    st.download_button("Tüm fonlar (CSV)",
+                                       bf.reset_index().to_csv(index=False).encode("utf-8-sig"),
+                                       "tefas_haftalik_fonlar.csv", "text/csv")
+
+with T["Portföy sepeti"]:
+    st.subheader("Portföy sepeti")
+    st.caption("Her fona yatıracağın tutarı gir; dağılım, risk ve geçmiş performans "
+               "birlikte gösterilir.")
+    bk_pick = st.multiselect("Sepetteki fonlar", list(p.columns),
+                             default=list(p.columns)[:3], key="bk_pick")
+    bk_per = st.radio("Geçmiş dönem", list(PERIODS), index=3, horizontal=True, key="bk_per")
+    amounts = {}
+    if bk_pick:
+        cols_b = st.columns(min(len(bk_pick), 4))
+        for i, c in enumerate(bk_pick):
+            amounts[c] = cols_b[i % len(cols_b)].number_input(
+                f"{c} tutarı (TL)", 0.0, 1e12, 50000.0, 1000.0, key=f"bk_amt_{c}")
+    rates_b = {}
+    with st.expander("Stopaj ve masraf ayarları"):
+        st.caption("Stopaj oranı fon adından tahmin edilir; izahnameden teyit edip "
+                   "değiştirebilirsin. Fon yönetim ücreti fiyata dahildir.")
+        q1, q2 = st.columns(2)
+        bk_buy = q1.number_input("Alım komisyonu (%)", 0.0, 10.0, 0.0, 0.05, key="bk_buy") / 100
+        bk_sell = q2.number_input("Satım komisyonu (%)", 0.0, 10.0, 0.0, 0.05, key="bk_sell") / 100
+        for c in bk_pick:
+            rate_b, kind_b = auto_stopaj(titles_all.get(c, ""))
+            rates_b[c] = st.number_input(f"{c} stopaj oranı (%): {kind_b}", 0.0, 50.0,
+                                         rate_b * 100, 0.5, key=f"bk_stp_{c}") / 100
+    if not bk_pick or sum(amounts.values()) <= 0:
+        st.info("En az bir fon seç ve tutar gir.")
+    else:
+        res = basket_analysis(p, amounts, PERIODS[bk_per], rates_b, bk_buy, bk_sell, alpha)
+        if res is None:
+            st.warning("Seçilen fonların ortak tarihlerinde yeterli veri yok.")
+        else:
+            tb = res["table"]
+            tot_b = tb["Tutar (TL)"].sum()
+            net_b = tb["Net değer (TL)"].sum()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Toplam tutar", tl(tot_b))
+            m2.metric("Brüt getiri", pc(res["ret"]))
+            m3.metric("Net elde edilen", tl(net_b), f"{(net_b / tot_b - 1) * 100:+.2f}%")
+            m4.metric("Çeşitlendirme oranı",
+                      "-" if pd.isna(res["div"]) else f"{res['div']:.2f}")
+            m5, m6, m7, m8 = st.columns(4)
+            m5.metric("Yıllık volatilite", pc(res["vol"]))
+            m6.metric("Maks. düşüş", pc(res["dd"]))
+            m7.metric(f"VaR %{int(alpha * 100)} (1g)", tl(res["var"] * tot_b))
+            m8.metric(f"CVaR %{int(alpha * 100)} (1g)", tl(res["cvar"] * tot_b))
+
+            d1, d2 = st.columns(2)
+            with d1:
+                st.markdown("##### Tutar dağılımı")
+                dd1 = tb["Tutar (TL)"].rename("Deger").rename_axis("Fon").reset_index()
+                st.altair_chart(donut_chart(dd1, "Fon", "Deger", th),
+                                use_container_width=True, theme=None)
+            with d2:
+                st.markdown("##### Risk katkısı dağılımı")
+                dd2 = (tb["Risk katkısı"].clip(lower=0).rename("Deger")
+                       .rename_axis("Fon").reset_index())
+                if dd2["Deger"].sum() > 0:
+                    st.altair_chart(donut_chart(dd2, "Fon", "Deger", th),
+                                    use_container_width=True, theme=None)
+                else:
+                    st.info("Risk katkısı hesaplanamadı.")
+
+            e1, e2 = st.columns(2)
+            with e1:
+                st.markdown("##### Sepet değeri (TL), fon bazında")
+                st.altair_chart(stacked_area(res["value"], th, "", ".2s"),
+                                use_container_width=True, theme=None)
+            with e2:
+                st.markdown("##### Fon bazında net kâr/zarar (TL)")
+                pf_b = (tb["Net kâr/zarar (TL)"].rename("Sonuc")
+                        .rename_axis("Fon").reset_index())
+                st.altair_chart(bar_pos_neg(pf_b, "Fon", "Sonuc", "", th, ".2s"),
+                                use_container_width=True, theme=None)
+
+            st.markdown("##### Yazılı değerlendirme")
+            lab_b = ("seçili veri aralığı" if PERIODS[bk_per] is None
+                     else f"son {bk_per.lower()}")
+            for para in basket_text(res, lab_b):
+                st.markdown(para)
+            fmt_b = {"Tutar (TL)": "{:,.0f}", "Ağırlık": "{:.1%}", "Dönem getirisi": "{:.2%}",
+                     "Risk katkısı": "{:.1%}", "Brüt değer (TL)": "{:,.0f}",
+                     "Stopaj (TL)": "{:,.0f}", "Masraf (TL)": "{:,.0f}",
+                     "Net değer (TL)": "{:,.0f}", "Net kâr/zarar (TL)": "{:,.0f}"}
+            st.dataframe(tb.style.format(fmt_b), use_container_width=True)
+            st.download_button("Tabloyu indir (CSV)", tb.to_csv().encode("utf-8-sig"),
+                               "sepet.csv", "text/csv")
+
+with T["Özet"]:
+    st.subheader("Dönemsel getiri ve sıralama")
+    pr = period_returns(p)
+    st.dataframe(pr.style.format({c: "{:.2%}" for c in pr.columns if c != "Sıra (3 Ay)"}),
+                 use_container_width=True)
+
+with T["Performans"]:
+    st.subheader("Normalize fiyat (başlangıç = 100)")
+    base = p.apply(lambda s: s.dropna().iloc[0])
+    st.altair_chart(line_chart(pf / base * 100, th, "", ",.0f"),
+                    use_container_width=True, theme=None)
+    st.subheader("Zirveden düşüş (drawdown)")
+    st.altair_chart(line_chart(pf / pf.cummax() - 1, th, "", ".0%"),
+                    use_container_width=True, theme=None)
+
+with T["Risk"]:
+    rt = risk_table(p, bench, rf, alpha)
+    fm = {c: "{:.2%}" for c in rt.columns if c != "Sharpe"}
+    fm["Sharpe"] = "{:.2f}"
+    st.dataframe(rt.style.format(fm), use_container_width=True)
+    if (p.index[-1] - p.index[0]).days < 90:
+        st.warning("Dönem 90 günden kısa: yıllıklandırılmış değerler yanıltıcı olabilir.")
+    st.download_button("Tabloyu indir (CSV)", rt.to_csv().encode("utf-8-sig"),
+                       "fon_risk.csv", "text/csv")
+    st.subheader("Risk-getiri dağılımı")
+    sc2 = (rt[["Yıllık volatilite", "Yıllık getiri"]].astype(float)
+           .rename(columns={"Yıllık volatilite": "Vol", "Yıllık getiri": "Getiri"})
+           .rename_axis("Fon").reset_index())
+    st.altair_chart(scatter_chart(sc2, th, ""), use_container_width=True, theme=None)
+    st.subheader("30 gözlemlik kayan volatilite (yıllıklandırılmış)")
+    R = returns_df(p)
+    rv = R.rolling(30, min_periods=20).std()
+    rvv = rv * np.sqrt(pd.Series({c: obs_per_year(p[c]) for c in p}))
+    st.altair_chart(line_chart(rvv, th, "", ".0%"), use_container_width=True, theme=None)
+    st.subheader("Getiri korelasyonu (ortak tarihler)")
+    st.altair_chart(corr_heatmap(R.corr(), th), use_container_width=True, theme=None)
+
+with T["Fon büyüklüğü ve akış"]:
+    ft, cum = flow_table(w)
+    if ft is None:
+        st.info("TEFAS'tan fon büyüklüğü bilgisi gelmedi. "
+                f"Gelen sütunlar: {', '.join(map(str, raw.columns))}")
+    else:
+        fm = {"Fon büyüklüğü (TL)": "{:,.0f}", "Net akış (1 Ay, TL)": "{:,.0f}",
+              "Büyüklük değişimi (1 Ay)": "{:.2%}", "Yatırımcı sayısı": "{:,.0f}",
+              "Yatırımcı değişimi (1 Ay)": "{:.2%}"}
+        st.dataframe(ft.style.format({k: v for k, v in fm.items() if k in ft.columns}),
+                     use_container_width=True)
+        st.caption("Net akış = pay sayısı değişimi x fiyat (tahmini).")
+        st.subheader("Kümülatif tahmini net akış (TL)")
+        st.altair_chart(line_chart(cum, th, "", ".2s"), use_container_width=True, theme=None)
+
+with T["Anomaliler"]:
+    st.caption("60 gözlemlik kayan pencerede |z| >= 3 olan günlük getiriler")
+    st.dataframe(detect_anomalies(p), use_container_width=True)
+
+with T["Metodoloji ve tutarlılık"]:
+    st.subheader("Hesaplama yöntemi")
+    st.markdown(
+        "- **Basit getiri:** r_t = P_t / P_(t-1) - 1 (her fon kendi gözlem tarihlerinde; "
+        "veri boşlukları doldurulmaz, boşluk üzerindeki getiri tek bir çok günlük getiridir)\n"
+        "- **Dönem getirisi:** R = P_T / P_0 - 1 = Π(1 + r_t) - 1 (zincirleme bağlama)\n"
+        "- **Yıllıklandırma:** (1 + R)^(365,25 / takvim günü) - 1\n"
+        "- **Yıllık gözlem sayısı:** n / (takvim günü / 365,25); sabit 252 varsayılmaz\n"
+        "- **Volatilite:** std(r) x √(yıllık gözlem)\n"
+        "- **Sharpe:** ortalama(r - rf_g) / std(r - rf_g) x √(yıllık gözlem); "
+        "rf_g = (1 + rf)^(1 / yıllık gözlem) - 1\n"
+        "- **VaR / CVaR:** tarihsel simülasyon, 1 gözlemlik getiri\n"
+        "- **Tracking error:** ortak tarihlerde (r_fon - r_kıyas) std x √(yıllık gözlem)\n"
+        "- **Net akış:** (pay_t - pay_(t-1)) x fiyat_t; pay sayısı yoksa fon büyüklüğü / fiyat")
+    st.subheader("Tutarlılık kontrolü")
+    st.caption("Fiyattan, zincirleme ve log toplamından hesaplanan dönem getirileri "
+               "aynı olmalı. Fark 1e-9'dan büyükse veri veya hesap sorunu vardır.")
+    cc = consistency_checks(p)
+    pct = ["Fiyattan dönem getirisi", "Zincirleme getiri", "Log toplamından getiri",
+           "Yıllık (takvim günü)", "Yıllık (252 gün varsayımı)", "En büyük günlük hareket"]
+    st.dataframe(cc.style.format({**{c: "{:.4%}" for c in pct}, "Fark": "{:.1e}"}),
+                 use_container_width=True)
+    st.caption("'Yıllık (252 gün varsayımı)' ile takvim günü bazlı değer arasındaki "
+               "fark, sabit gün sayısı varsaymanın etkisini gösterir. "
+               "Eksik iş günlerinin çoğu resmi tatillerdir.")
+
+with T["Yatırımcı karşılaştırma"]:
+    st.subheader("Yatırımcı karşılaştırma")
+    st.caption("Fonları seç, tutarı gir. Geçmiş verilere göre stopaj ve masraflar "
+               "düşüldükten sonra hangi fonun daha fazla getiri sağladığını ve hangisinin "
+               "daha az risk taşıdığını yazılı verir.")
+    pick = st.multiselect("Karşılaştırılacak fonlar", list(p.columns),
+                          default=list(p.columns)[:3])
+    amount = st.number_input("Yatırım tutarı (TL)", min_value=1000.0,
+                             value=100000.0, step=1000.0)
+    per = st.radio("Geçmiş dönem", list(PERIODS), index=3, horizontal=True)
+    titles = {}
+    if "title" in raw.columns:
+        titles = (raw.dropna(subset=["title"]).drop_duplicates("code")
+                  .set_index("code")["title"].to_dict())
+    rates = {}
+    with st.expander("Stopaj ve masraf ayarları"):
+        st.caption("Stopaj oranı fon adından otomatik tahmin edilir (hisse senedi yoğun "
+                   "fonlar %0, diğerleri %17,5 gerçek kişi için). Mevzuat sık değiştiği "
+                   "için oranları fon izahnamesinden teyit edip değiştirebilirsin. "
+                   "Fon yönetim ücreti fiyata dahildir, ayrıca düşülmez.")
+        b1, b2 = st.columns(2)
+        buy_fee = b1.number_input("Alım komisyonu (%)", 0.0, 10.0, 0.0, 0.05) / 100
+        sell_fee = b2.number_input("Satım komisyonu (%)", 0.0, 10.0, 0.0, 0.05) / 100
+        for c in pick:
+            rate, kind = auto_stopaj(titles.get(c, ""))
+            rates[c] = st.number_input(f"{c} stopaj oranı (%): {kind}", 0.0, 50.0,
+                                       rate * 100, 0.5, key=f"stp_{c}") / 100
+    if len(pick) < 2:
+        st.info("Karşılaştırma için en az iki fon seç.")
+    else:
+        m = investor_metrics(p, pick, amount, PERIODS[per], rf, rates, buy_fee, sell_fee)
+        if m.empty:
+            st.warning("Seçilen fonlar için bu dönemde yeterli veri yok.")
+        else:
+            label = ("seçili veri aralığı" if PERIODS[per] is None
+                     else f"son {per.lower()}")
+            for para in investor_text(m, amount, label, rf):
+                st.markdown(para)
+            fmt = {"Brüt fon getirisi": "{:.2%}", "Brüt dönem sonu değer (TL)": "{:,.0f}",
+                   "Brüt kâr/zarar (TL)": "{:,.0f}", "Stopaj oranı": "{:.2%}",
+                   "Stopaj (TL)": "{:,.0f}", "Masraf (TL)": "{:,.0f}",
+                   "Net elde edilen (TL)": "{:,.0f}", "Net kâr/zarar (TL)": "{:,.0f}",
+                   "Net getiri": "{:.2%}", "Yıllık volatilite": "{:.2%}",
+                   "Maks. düşüş": "{:.2%}", "Maks. düşüş (TL)": "{:,.0f}",
+                   "Kötü ay %5 (getiri)": "{:.2%}", "Kötü ay %5 (TL)": "{:,.0f}",
+                   "Sharpe": "{:.2f}"}
+            st.dataframe(m.style.format(fmt), use_container_width=True)
+            st.caption("Stopaj, dönem sonunda satış varsayımıyla yalnızca kazançtan "
+                       "hesaplanır; zararda stopaj yoktur. Kötü ay %5: geçmişteki 21 "
+                       "gözlemlik (yaklaşık 1 aylık) getirilerin en kötü %5'lik diliminin "
+                       "eşiği. Risk göstergeleri brüt fiyat serisine dayanır.")
+
+st.divider()
+st.caption("Bu panel bilgilendirme amaçlıdır, yatırım tavsiyesi değildir. "
+           "Geçmiş performans gelecekteki getirinin garantisi değildir. "
+           "Veriler TEFAS kaynaklıdır; kritik rakamları resmi kaynaktan teyit ediniz.")
