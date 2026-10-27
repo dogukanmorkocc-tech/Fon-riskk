@@ -5,6 +5,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from etf_panel import render_etf, render_etf_analiz
+
+NAMES = ['Home', 'Portföy sepeti', 'Yatırımcı karşılaştırma', 'Performans', 'Risk',
+         'Varlık dağılımı', 'Fon büyüklüğü ve akış', 'ETF', 'ETF Analiz']
+
 st.set_page_config(page_title="Fon Analiz Paneli", layout="wide")
 TD = 252
 
@@ -1779,7 +1784,10 @@ with T["Yatırımcı karşılaştırma"]:
                        "hesaplanır; zararda stopaj yoktur. Kötü ay %5: geçmişteki 21 "
                        "gözlemlik (yaklaşık 1 aylık) getirilerin en kötü %5'lik diliminin "
                        "eşiği. Risk göstergeleri brüt fiyat serisine dayanır.")
-
+with T["ETF"]:
+    render_etf(globals())
+with T["ETF Analiz"]:
+    render_etf_analiz(globals())
 st.divider()
 st.caption("Bu panel bilgilendirme amaçlıdır, yatırım tavsiyesi değildir. "
            "Geçmiş performans gelecekteki getirinin garantisi değildir. "
